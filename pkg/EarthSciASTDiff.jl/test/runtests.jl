@@ -70,4 +70,5 @@ end
     include("join_test.jl")
     include("makearray_of_reads_test.jl")
     include("zero_power_test.jl")
+    include("guarded_quotient_test.jl")
 end
