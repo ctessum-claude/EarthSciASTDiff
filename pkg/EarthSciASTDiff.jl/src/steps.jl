@@ -333,6 +333,15 @@ end
 const _INTER_RE = r"^_d([upf])_(.*)_([0-9]+)_*$"
 
 # The axis and observed of intermediate name `n`, or `nothing`.
+# The observed a companion name `_dt_<o>` (`P._dt_<v>` for `P.v`) is of, or
+# `nothing` for another name.
+function _dt_observed(n::AbstractString)
+    i = findlast('.', n)
+    scope, base = i === nothing ? ("", n) : (n[1:i], n[nextind(n, i):end])
+    startswith(base, "_dt_") || return nothing
+    return scope * base[5:end]
+end
+
 function _inter_parse(n::AbstractString)
     i = findlast('.', n)
     scope, base = i === nothing ? ("", n) : (n[1:i], n[nextind(n, i):end])
@@ -354,38 +363,71 @@ of the other axes (§4.6). What a block's `intermediates` field and every
 derived document of the list carry.
 """
 function _intermediates(sv::SysView, entries; forcing = nothing, info = nothing)
-    out = Tuple{String, String, ASTExpr, Int}[
-        (n, o, d, 0) for (n, o, d) in _time_companions(sv, entries; info = info)
-    ]
     work = String[]
     for en in entries, x in (en.band.coef, en.band.guard)
         x === nothing && continue
         for n in free_variables(x)
             _inter_parse(n) === nothing || push!(work, n)
+            # a time pair's companion of a named intermediate (§4.4)
+            o = _dt_observed(n)
+            o === nothing || _inter_parse(o) === nothing || push!(work, o)
         end
     end
-    isempty(work) && return out
+    if isempty(work)
+        return Tuple{String, String, ASTExpr, Int}[
+            (n, o, d, 0) for (n, o, d) in _time_companions(sv, entries; info = info)
+        ]
+    end
     ctx = _ctx(sv)
     obs = _observed_defs(sv)
     recs = recurrences(sv, obs, ctx)
     scalars = _declared_scalars(sv, obs)
-    passes = Dict{Symbol, _Steps}()
     defs = Dict{String, Tuple{String, ASTExpr, Int}}()
-    while !isempty(work)
-        n = pop!(work)
-        haskey(defs, n) && continue
-        wrt, o = _inter_parse(n)
-        st = get!(passes, wrt) do
-            _steps_pass(sv, ctx, obs, recs, wrt, forcing, _targets(sv, wrt, forcing, obs), scalars, true)
-        end
-        haskey(st.inters, n) || _steps_composed!(st, o)
-        hit = get(st.inters, n, nothing)
-        hit === nothing && throw(BandError("no named intermediate `$n` (observed `$o`, $(wrt))"))
-        defs[n] = hit
-        for m in free_variables(hit[2])
-            _inter_parse(m) === nothing || haskey(defs, m) || push!(work, m)
+    # A pair's second-axis step of a first-axis intermediate (§4.4) is named
+    # after that intermediate (`_dp__du_o_1_1`): the intermediates whose
+    # observed is a source observed are resolved first, then those over them,
+    # each level's passes taking the levels below as observed.
+    level(n) = (o = _inter_parse(n)[2]; _inter_parse(o) === nothing ? 0 : 1 + level(o))
+    passes = Dict{Tuple{Symbol, Int}, _Steps}()
+    # a nested name's own observed is an intermediate of the level below
+    function chain!(acc, n)
+        push!(acc, n)
+        o = _inter_parse(n)[2]
+        _inter_parse(o) === nothing || chain!(acc, o)
+        return acc
+    end
+    pending = String[]
+    foreach(n -> chain!(pending, n), work)
+    while !isempty(pending)
+        lv = minimum(level, pending)
+        # passes over this level's names are rebuilt with the levels below
+        filter!(kv -> kv[1][2] <= lv, passes)
+        here = String[n for n in pending if level(n) == lv]
+        filter!(n -> level(n) != lv, pending)
+        while !isempty(here)
+            n = pop!(here)
+            haskey(defs, n) && continue
+            wrt, o = _inter_parse(n)
+            st = get!(passes, (wrt, lv)) do
+                obs2 = Dict{String, ASTExpr}(k => v for (k, v) in obs if !(k in Set(r.name for r in recs)))
+                lv == 0 || merge!(obs2, Dict{String, ASTExpr}(m => d for (m, (_, d, _)) in defs))
+                lv == 0 ? _steps_pass(sv, ctx, obs, recs, wrt, forcing, _targets(sv, wrt, forcing, obs), scalars, true) :
+                    _steps_setup(sv, ctx, obs2, _targets(sv, wrt, forcing, obs), scalars, true; letter = _STEP_LETTER[wrt])
+            end
+            haskey(st.inters, n) || _steps_composed!(st, o)
+            hit = get(st.inters, n, nothing)
+            hit === nothing && throw(BandError("no named intermediate `$n` (observed `$o`, $(wrt))"))
+            defs[n] = hit
+            for m in free_variables(hit[2])
+                (_inter_parse(m) === nothing || haskey(defs, m)) && continue
+                level(m) == lv ? push!(here, m) : chain!(pending, m)
+            end
         end
     end
+    extra = Dict{String, ASTExpr}(n => d for (n, (_, d, _)) in defs)
+    out = Tuple{String, String, ASTExpr, Int}[
+        (n, o, d, 0) for (n, o, d) in _time_companions(sv, entries; info = info, extra = extra)
+    ]
     axis = sort!([(o, n, d, c) for (n, (o, d, c)) in defs])
     append!(out, Tuple{String, String, ASTExpr, Int}[(n, o, d, c) for (o, n, d, c) in axis])
     return sort!(out; by = x -> (x[2], x[1]))

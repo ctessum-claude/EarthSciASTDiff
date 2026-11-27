@@ -42,12 +42,12 @@ pub(crate) struct Steps {
     letter: String,
     taken: HashSet<String>,
     pub(crate) inters: HashMap<String, (String, Expr, usize)>,
-    targets: HashSet<String>,
-    cols: HashSet<String>,
+    pub(crate) targets: HashSet<String>,
+    pub(crate) cols: HashSet<String>,
     pub(crate) inline: HashMap<String, Expr>,
     obs: HashMap<String, Expr>,
-    ctx: Ctx,
-    scalars: HashSet<String>,
+    pub(crate) ctx: Ctx,
+    pub(crate) scalars: HashSet<String>,
     co: bool,
     composed: HashMap<String, Vec<JacEntry>>,
     busy: HashSet<String>,
@@ -373,6 +373,16 @@ fn inter_definition(b: &Band, dims: &[Dim]) -> Expr {
 
 /// The axis and observed of intermediate name `n`, or `None` (steps.jl
 /// `_inter_parse`).
+/// The observed a companion name `_dt_<o>` (`P._dt_<v>` for `P.v`) is of,
+/// or `None` for another name (steps.jl `_dt_observed`).
+pub(crate) fn dt_observed(n: &str) -> Option<String> {
+    let (scope, base) = match n.rfind('.') {
+        None => ("", n),
+        Some(i) => (&n[..=i], &n[i + 1..]),
+    };
+    base.strip_prefix("_dt_").map(|o| format!("{scope}{o}"))
+}
+
 pub(crate) fn inter_parse(n: &str) -> Option<(Wrt, String)> {
     let (scope, base) = match n.rfind('.') {
         None => ("", n),
@@ -402,67 +412,120 @@ pub(crate) fn intermediates(
     bands: &[&Band],
     forcing: Option<&[String]>,
 ) -> R<Vec<(String, String, Expr, usize)>> {
-    let mut out: Vec<(String, String, Expr, usize)> =
-        crate::companions::time_companions(sv, bands)?
-            .into_iter()
-            .map(|(n, o, d)| (n, o, d, 0))
-            .collect();
     let mut work: Vec<String> = Vec::new();
     for b in bands {
         for x in std::iter::once(&b.coef).chain(b.guard.iter()) {
             for n in free_variables(x) {
                 if inter_parse(&n).is_some() {
-                    work.push(n);
+                    work.push(n.clone());
+                }
+                // a time pair's companion of a named intermediate (§4.4)
+                if let Some(o) = dt_observed(&n) {
+                    if inter_parse(&o).is_some() {
+                        work.push(o);
+                    }
                 }
             }
         }
     }
     if work.is_empty() {
-        return Ok(out);
+        return Ok(
+            crate::companions::time_companions(sv, bands, &HashMap::new())?
+                .into_iter()
+                .map(|(n, o, d)| (n, o, d, 0))
+                .collect(),
+        );
     }
     let ctx = crate::system::ctx_of(sv)?;
     let obs = crate::system::observed_defs(sv)?;
     let recs = crate::recurrence::recurrences(sv, &obs, &ctx)?;
     let scalars = crate::jacobian::declared_scalars(sv, &obs);
-    let mut passes: HashMap<Wrt, Steps> = HashMap::new();
+    let mut nr = obs.clone();
+    for r in &recs {
+        nr.remove(&r.name);
+    }
+    // A pair's second-axis step of a first-axis intermediate (§4.4) is named
+    // after that intermediate (`_dp__du_o_1_1`): the intermediates whose
+    // observed is a source observed are resolved first, then those over them,
+    // each level's passes taking the levels below as observed (steps.jl).
+    fn level(n: &str) -> usize {
+        let (_, o) = inter_parse(n).expect("an intermediate name");
+        if inter_parse(&o).is_some() {
+            1 + level(&o)
+        } else {
+            0
+        }
+    }
+    fn chain(acc: &mut Vec<String>, n: String) {
+        let (_, o) = inter_parse(&n).expect("an intermediate name");
+        acc.push(n);
+        if inter_parse(&o).is_some() {
+            chain(acc, o);
+        }
+    }
+    let mut passes: HashMap<(Wrt, usize), Steps> = HashMap::new();
     let mut defs: BTreeMap<String, (String, Expr, usize)> = BTreeMap::new();
-    while let Some(n) = work.pop() {
-        if defs.contains_key(&n) {
-            continue;
-        }
-        let (wrt, o) = inter_parse(&n).expect("parsed above");
-        let st = match passes.entry(wrt) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let mut nr = obs.clone();
-                for r in &recs {
-                    nr.remove(&r.name);
-                }
-                let tset: HashSet<String> = crate::jacobian::targets(sv, wrt, forcing, &obs)?
-                    .into_iter()
-                    .collect();
-                let letter = match wrt {
-                    Wrt::States => "u",
-                    Wrt::Parameters => "p",
-                    _ => "f",
-                };
-                e.insert(steps_setup(sv, &ctx, nr, &tset, &scalars, true, letter)?)
+    let mut pending: Vec<String> = Vec::new();
+    for n in work {
+        chain(&mut pending, n);
+    }
+    while !pending.is_empty() {
+        let lv = pending.iter().map(|n| level(n)).min().unwrap();
+        passes.retain(|k, _| k.1 <= lv);
+        let mut here: Vec<String> = pending.iter().filter(|n| level(n) == lv).cloned().collect();
+        pending.retain(|n| level(n) != lv);
+        while let Some(n) = here.pop() {
+            if defs.contains_key(&n) {
+                continue;
             }
-        };
-        if !st.inters.contains_key(&n) {
-            steps_composed(st, &o)?;
-        }
-        let hit =
-            st.inters.get(&n).cloned().ok_or_else(|| {
+            let (wrt, o) = inter_parse(&n).expect("parsed above");
+            let key = (wrt, lv);
+            let st = match passes.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let mut o2 = nr.clone();
+                    if lv > 0 {
+                        o2.extend(defs.iter().map(|(m, (_, d, _))| (m.clone(), d.clone())));
+                    }
+                    let tset: HashSet<String> = crate::jacobian::targets(sv, wrt, forcing, &obs)?
+                        .into_iter()
+                        .collect();
+                    let letter = match wrt {
+                        Wrt::States => "u",
+                        Wrt::Parameters => "p",
+                        _ => "f",
+                    };
+                    e.insert(steps_setup(sv, &ctx, o2, &tset, &scalars, true, letter)?)
+                }
+            };
+            if !st.inters.contains_key(&n) {
+                steps_composed(st, &o)?;
+            }
+            let hit = st.inters.get(&n).cloned().ok_or_else(|| {
                 BandError(format!("no named intermediate `{n}` (observed `{o}`)"))
             })?;
-        for m in free_variables(&hit.1) {
-            if inter_parse(&m).is_some() && !defs.contains_key(&m) {
-                work.push(m);
+            for m in free_variables(&hit.1) {
+                if inter_parse(&m).is_none() || defs.contains_key(&m) {
+                    continue;
+                }
+                if level(&m) == lv {
+                    here.push(m);
+                } else {
+                    chain(&mut pending, m);
+                }
             }
+            defs.insert(n, hit);
         }
-        defs.insert(n, hit);
     }
+    let extra: HashMap<String, Expr> = defs
+        .iter()
+        .map(|(n, (_, d, _))| (n.clone(), d.clone()))
+        .collect();
+    let mut out: Vec<(String, String, Expr, usize)> =
+        crate::companions::time_companions(sv, bands, &extra)?
+            .into_iter()
+            .map(|(n, o, d)| (n, o, d, 0))
+            .collect();
     for (n, (o, d, c)) in defs {
         out.push((n, o, d, c));
     }
@@ -474,7 +537,7 @@ pub(crate) fn intermediates(
 /// summed into its coefficient: a scalar `faq` (reduce `+`) over their
 /// ranges whose filter is the `where` conjuncts that read them (in order);
 /// the other conjuncts stay the band's `where` (steps.jl `_steps_sum_free`).
-fn steps_sum_free(b: &Band, co: bool) -> Band {
+pub(crate) fn steps_sum_free(b: &Band, co: bool) -> Band {
     if b.contracted.is_empty() {
         return b.clone();
     }
@@ -544,7 +607,7 @@ fn steps_sum_free(b: &Band, co: bool) -> Band {
 /// through the observed graph, combined into the first of them: their
 /// coefficients summed (an n-ary `+`, in order), or, structure-only, kept
 /// once (steps.jl `_steps_combine`).
-fn steps_combine(bs: Vec<Band>, co: bool) -> Vec<Band> {
+pub(crate) fn steps_combine(bs: Vec<Band>, co: bool) -> Vec<Band> {
     type Key = (
         Vec<(i64, i64)>,
         Vec<RIdx>,

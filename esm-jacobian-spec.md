@@ -1102,11 +1102,24 @@ derivative of `f_t` when the method passes it.
 the `a1` axis, the producer differentiates `e.coef` with respect to every
 site of every `a2` target, treating it as a scalar body broadcast over
 `e.rows`: region clipping, re-merging of equal-coefficient entries and
-singleton pinning as for any scalar body. The first-order pass inlines the
-observed that move with either axis (§4.3's seeding, over the union of the
-two target sets): an observed rate that reads only parameters is an opaque
-read on the state axis and would hide its parameter sites from the second
-derivative. The non-smooth policy (§3.2) applies again — `ifelse`
+singleton pinning as for any scalar body. With no recurrence active on
+either axis, the first-order pass keeps its named steps (§4.6), and its
+named intermediates are observed of a named-steps pass over the `a2`
+targets (definitions as in the block's `intermediates`, declared without a
+shape, extents their definitions'). An `a2` target `e.coef` reads is
+differentiated at its sites; an observed or intermediate that moves with
+`a2` (an observed rate that reads only parameters is one: opaque on the
+state axis, it would otherwise hide its parameter sites) is a column whose
+bands are composed with its composed `a2` bands, never inlined. Those
+bands' coefficients are named steps of the `a2` pass, named after the
+intermediate they step through (`_dp__du_o_1_1`, a parameters step of
+`_du_o_1`); a consumer resolves the intermediates level by level, those
+over source observed first. The first-order column indices lead every
+band's column indices; bands of one entry and second column are combined,
+merged and normalized as on a first-order row. Through an active
+recurrence the first-order pass inlines the observed that move with
+either axis (§4.3's seeding, over the union of the two target sets).
+The non-smooth policy (§3.2) applies again — `ifelse`
 differentiates branch-wise with the condition's Dirac term dropped, ties of
 `max`/`min` keep the earlier argument — and the pattern is the structural,
 global union over branches (§2). A piecewise-linear limiter therefore has an
@@ -1118,17 +1131,21 @@ of `f` is a smooth function, so on it the mixed partials commute:
 derivative is taken first (an `ifelse` keeps its condition, a `max`/`min` its
 tie rule), so both orders give the same tensor. A pair `["time", a2]` with
 no recurrence active on either axis is therefore produced with the time
-derivative second: for each first-order entry `e'` of the `a2` axis (§4.3's
-inlining, seeded from the `a2` targets only), in entry order, the producer
+derivative second: for each first-order entry `e'` of the `a2` axis (its
+named steps, §4.6), in entry order, the producer
 takes the time bands of `e'.coef`, broadcast over `e'.rows` with its
 contracted names bound, by §4.2's rule: `t` and every observed that moves
 with `t` and is not inlined are columns, in code-point order, each observed
 band composed with its time companion (coefficient `coef · _dt_o[φ…]`,
 gated where `φ` is not provably in `o`'s extent), the observed a column
-index needs inlined into `e'.coef` first. An observed that moves with `a2`
-is already inlined in `e'.coef`; one that moves only with `t` (a photolysis
-rate, a blend weight) stays an opaque read there and is reached through its
-companion, so the chain through it is written once, not in every row.
+index needs inlined into `e'.coef` first. The `a2` axis's named
+intermediates `e'.coef` reads are observed of this pass (definitions as in
+the block's `intermediates`, declared without a shape, their extents their
+definitions'): one that moves with `t` is a column composed with its own
+companion `_dt_<name>`, which the pair block's `intermediates` then
+declares with it. An observed that moves only with `t` (a photolysis rate,
+a blend weight) stays an opaque read in `e'.coef` and is reached through its
+companion, so the chain through either is written once, not in every row.
 Contracted dimensions a site under a nested sum adds (§3.5) stay
 `contracted`, not summed into the coefficient: `col2_idx` may read them.
 The bands of one `e'` with the same rows, row names, `col2_idx`,
