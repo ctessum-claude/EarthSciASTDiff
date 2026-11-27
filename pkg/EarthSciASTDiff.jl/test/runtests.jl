@@ -69,4 +69,5 @@ end
     include("steps_test.jl")
     include("join_test.jl")
     include("makearray_of_reads_test.jl")
+    include("zero_power_test.jl")
 end
